@@ -1,0 +1,753 @@
+---
+title: Historical contingency in the evolution of antibiotic resistance after decades of relaxed selection
+output: html_notebook
+---
+
+# Purpose
+
+This R Markdown contains code used to analyze: 
+
+1. The intrinsic antibiotic resistance of the LTEE ancestor and derived generation 50,000 strains to determine whether resistance decays during evolution in the absence of drug exposure.
+2. Each strain's resistance evolvability in the presence of these drugs.
+3. Intrinsic tetracycline resistance and subsequent evolvability of a time-series of clones isolated from the Ara+5 population across the first 10,000 generations. 
+
+It also generates all associated figures.
+
+<br>
+__NOTE: The .csv data files and this R Markdown need to be placed in the same directory first!__
+
+***
+
+## Prerequisites
+
+Clear current environment
+```{r Clear current environment}
+rm(list = ls())
+```
+<br>
+
+
+Load packages for use
+```{r Packages, messages = FALSE}
+library(tidyverse) # Version 1.2.1
+library(metap) # Version 1.1
+library(DescTools) # Version 0.99.28
+library(binom) # Version 1.1-1
+library(cowplot) # Version 1.0.0
+library(gridExtra) # Version 2.3
+library(ggrepel) # Version 0.8.1
+```
+<br>
+
+
+***
+
+```{r Factor levels}
+anc.derived.strains <- c("Ancestor", "Ara\u20135", "Ara\u20136", "Ara+4", "Ara+5") # "\u2013" is unicode for "en dash"
+derived.strains <- c("Ara\u20135", "Ara\u20136", "Ara+4", "Ara+5") # "\u2013" is unicode for "en dash"
+ara5.strains <- c("0", "0.5A", "0.5B", "1A", "1B", "1.5B", "1.5A", "2A", "2B", "5A", "5B", "10A", "10B")
+antibiotics <- c("amp", "cro", "cip", "tet")
+genotypes <- c("parent", "daughter")
+panel.titles <- c("Ampicillin", "Ceftriaxone", "Ciprofloxacin", "Tetracycline")
+fluctuation.strains <- c("REL606", "REL1162A")
+bounds <- c("lower", "upper")
+```
+<br>
+
+
+***
+
+# Data transformation and wrangling
+
+Reads in *MICs of LTEE ancestral and derived strains* data showing the minimum inhibitory concentrations (MICs) of various antibiotics (ampicillin, ceftriaxone, ciprofloxacin, and tetracycline) on the LTEE ancestral and generation 50,000 derived clones (Ara-5, Ara-6, Ara+4, and Ara+5), and their evolved resistant mutants. The code then performs a binary logarithmic transformation of the MIC data to match the two-fold dilution scheme of the evolvability assays. Lastly, it performs data wrangling steps for downstream work.
+```{r Manipulation of "MICs of LTEE ancestral and derived strains" data}
+df <- read.csv("MICs of LTEE ancestral and derived strains.csv")
+
+# Add row ID variable that will be used in data wrangling to determine each clone's resistance evolvability.
+df$row.ID <- 1:nrow(df)
+
+log2.df <- df %>% 
+  gather(genotype, MIC, amp.parent:tet.daughter)
+
+# Binary logarithm transformation
+log2.df$MIC <- log2(log2.df$MIC)
+
+# Expand the genotype column into two separate columns containing information about the antibiotic and genotype for each clone.
+ExpandData <- function(dat, antibiotics) {
+  expand.dat <- dat %>% 
+    filter(grepl(antibiotics, genotype)) %>%
+    add_column(antibiotic = antibiotics, .after = 1) %>% 
+    mutate(genotype = replace(genotype, genotype == paste(antibiotics, ".parent", sep = ""), "parent")) %>%
+    mutate(genotype = replace(genotype, genotype == paste(antibiotics, ".daughter", sep = ""), "daughter"))
+}
+
+expanded.df <- map(antibiotics, function(x) {ExpandData(log2.df, x)}) %>% 
+  bind_rows()
+```
+<br>
+
+
+Performs similar transformation on *MICs of strains from Ara+5 population* data.
+```{r Manipulation of "MICs of strains from Ara+5 population" data}
+ara5.df <- read.csv("MICs of strains from Ara+5 population.csv")
+
+ara5.df$row.ID <- 1:nrow(ara5.df)
+log2.ara5.df <- ara5.df %>% 
+  gather(genotype, MIC, parent:daughter)
+
+# Binary logarithm transformation
+log2.ara5.df$MIC <- log2(log2.ara5.df$MIC)
+```
+<br>
+
+
+Reads in *Mutant colony counts* data showing the number of tetracycline resistant clones derived from 84 independent populations each of the LTEE ancestor (REL606) and clone A isolated from the Ara+5 population after 2,000 generations (REL1162A). These data are used in the fluctuation analysis below. 
+```{r Colony count data}
+colony.counts.df <- read.csv("Mutant colony counts.csv")
+```
+<br>
+
+Reads in *Cell counts* data showing the number of cell counts from 12 independent populations each of the LTEE ancestor (REL606) and clone A isolated from the Ara+5 population after 2,000 generations (REL1162A). These data are used in the fluctuation analysis below.
+```{r Cell count data}
+cell.counts.df <- read.csv("Cell counts.csv")
+```
+
+
+***
+
+# Data analysis
+
+## Maintenance of intrinsic resistance during relaxed selection in the LTEE
+
+We compare the MIC value of each derived clone (Ara-5, Ara-6, Ara+4, and Ara+5) with its corresponding paired ancestral value. We expected that the bacteria would evolve to be more susceptible to antibiotics given the absence of drug exposure during the LTEE. The derived clones should have lower MICs as a consequence. If this history of relaxed selection has no effect on susceptibility then a derived clone's MIC could be lower, higher, or equal to its ancestral counterpart. On the one hand, numerical ties are conventionally excluded from these analyses, and the null hypothesis is that positive and negative differences are distributed by the binomial distribution where $p = 0.5$ (Dixon and Mood, 1946). On the other hand, Wittkowski (1989) argues that the omission of ties is inadvisable when they can be interpreted as non-zero differences that are too small to be observable, usually by rounding error. Moreover, Bian, McAleer, and Wong (2011) argue the omission of ties leads to loss of information and substantially reduced statistical power. They introduce the *trinomial test* that includes numerical ties effectively. We therefore use this statistical test here and elsewhere in our study. 
+
+If a derived clone has a lower MIC value than its paired ancestral value (expectation), then it is assigned a dummy value of 1. If not, it is assigned a value of 0 or -1 if it's tied or higher, respectively. The trinomial test is performed for each strain and the resulting significance probabilities are then combined using Fisher's method (Fisher, 1934) (Sokal and Rohlf, 1994).  
+```{r Meta-analysis of increased susceptibilities during relaxed selection}
+# Assigns "dummy" variables for each comparison
+DummyVariables.RS <- function(dat) { # "RS" denotes "relaxed selection". A modified version of this function, to calculate evolvability *p*-values, is used below.  
+  ancestor.frame <- dat %>% 
+    filter(strain == "Ancestor", genotype == "parent")
+  
+  derived.frame <- dat %>% 
+    filter(strain %in% derived.strains, genotype == "parent")
+  
+  compare.values <- c()
+  
+  for(i in 1:nrow(derived.frame)) {
+    derived.row <- derived.frame[i,]
+    pairedID <- derived.row$paired.ID 
+    ab <- derived.row$antibiotic
+    ancestor.row <- filter(ancestor.frame, paired.ID == pairedID, antibiotic == ab)
+    compare.values <- c(compare.values, ifelse(derived.row$MIC < ancestor.row$MIC, 1,
+                                               ifelse(derived.row$MIC == ancestor.row$MIC, 0, -1)))
+  }
+  
+  remove.cols.frame <- derived.frame %>%
+    select(-(paired.ID:MIC))
+  
+  remove.cols.frame$dummy <- compare.values
+  
+  return(remove.cols.frame)
+}
+
+dummy.rs.df <- DummyVariables.RS(expanded.df)
+
+# Computes the *p*-value for each strain using the trinomial test
+TrinomialTest <- function(dat) {
+  
+  n.pos <- dat %>%
+    filter(dummy == 1) %>%
+    nrow()
+
+  n.ties <- dat %>%
+    filter(dummy == 0) %>%
+    nrow()
+
+  n.neg <- dat %>%
+    filter(dummy == -1) %>%
+    nrow()
+  
+  n <- n.pos + n.ties + n.neg
+  nd <- abs(n.pos - n.neg)
+  p.ties <- n.ties / (n.pos + n.ties + n.neg) # Unbiased estimate of the probability of numerical ties (Bian, McAleer, and Wong 2011)
+  x <- (n - nd) / 2
+  
+  prob <- c()
+  
+  for(k in 0:x) {
+    test <- (factorial(n)) / (factorial(nd + k) * factorial(k) * factorial(n - nd - 2*k)) * 
+      (((1 - p.ties) / 2) ^ (nd + (2*k))) * 
+      ((p.ties) ^ (n - nd - 2*k))
+    
+    prob <- c(prob, test)
+  }
+  
+# If the differences are in the direction of expectation given the alternative, then determine P(Nd) as described in Bian, McAleer, and Wong (2011). If the differences are in the direction *opposite* expectation, then 1 - P(Nd).
+  sum.prob <- sum(prob)
+  corrected.sum.prob <- ifelse(n.pos >= n.neg, sum.prob, (1 - sum.prob))
+  
+  return(corrected.sum.prob)
+}
+
+pvalues.rs <- c()
+
+for (i in unique(antibiotics)) {
+  ab.subset <- dummy.rs.df %>% 
+    filter(antibiotic == i)
+  
+  for(j in unique(derived.strains)) {
+    strain.subset <- ab.subset %>% 
+      filter(strain == j)
+    
+    pvalues.rs <- c(pvalues.rs, TrinomialTest(strain.subset)) 
+  }
+}
+
+# This data frame corresponds to S1 Table
+pval.rs.df <- data.frame( 
+  strain = rep(derived.strains, 4),
+  antibiotic = rep(antibiotics, each = 4),
+  p = pvalues.rs
+  )
+
+# Combines *p*-values by the sum of logs (Fisher's) method
+CalculateCombinedPValues <- function(dat, ab) {
+  ab.filter <- dat %>% 
+    filter(antibiotic == ab)
+  
+  sum.log.method <- sumlog(ab.filter$p)
+  
+  return(sum.log.method)
+}
+
+combined.pval.rs.df <- map(antibiotics, function(x) {CalculateCombinedPValues(pval.rs.df, x)})
+names(combined.pval.rs.df) <- antibiotics
+
+print(combined.pval.rs.df)
+```
+<br>
+
+
+***
+
+## Evolvability of antibiotic resistance in the LTEE
+
+We show with trinomial tests, and subsequent meta-analyses, that the derived clones have become more susceptible during evolution in the absence of antibiotic exposure in the LTEE. Under a *diminishing-returns* model, backgrounds with lower initial resistance are more evolvable than backgrounds that are initially more resistant. On balance, evolved clones would therefore evolve more resistance relative to their paired ancestors. Conversely, if evolvability is not correlated with the initial level of resistance, and hence *idiosyncratic*, then a derived clone's MIC could be lower, higher, or equal to its ancestral counterpart. We use the trinomial test to examine the former trend, and Kruskal-Wallis one-way ANOVA for the latter. 
+
+If a derived clone is more evolvable than its paired ancestor, then it is assigned a dummy value of 1. If not, it is assigned a value of 0 or -1 if it's tied or lower, respectively. The trinomial test is performed for each strain and the resulting significance probabilities are then combined using Fisher's method.  
+```{r Meta-analysis of strain evolvability (diminishing returns)}
+# Calculates evolvability of each strain
+CalculateEvolvability <- function(dat) { 
+  parental.frame <- dat %>% 
+    filter(genotype == "parent")
+  
+  daughter.frame <- dat %>% 
+    filter(genotype == "daughter")
+  
+  evolvability.values <- c()
+  
+  for(i in 1:nrow(daughter.frame)) {
+    daughter.row <- daughter.frame[i,]
+    rowID <- daughter.row$row.ID 
+    ab <- daughter.row$antibiotic
+    parent.row <- filter(parental.frame, row.ID == rowID, antibiotic == ab)
+    evolvability.values <- c(evolvability.values, round(daughter.row$MIC - parent.row$MIC))
+  }
+  
+  remove.cols.frame <- daughter.frame %>% 
+    select(-genotype, -MIC)
+  
+  remove.cols.frame$evolvability <- evolvability.values
+  
+  return(remove.cols.frame)
+}
+
+evolvability.df <- CalculateEvolvability(expanded.df)
+
+# Assigns "dummy" variables for each comparison
+DummyVariables.Evo <- function(dat) { # "Evo" denotes "evolvability".
+  ancestor.frame <- dat %>% 
+    filter(strain == "Ancestor")
+  
+  derived.frame <- dat %>% 
+    filter(strain %in% derived.strains)
+  
+  compare.values <- c()
+  
+  for(i in 1:nrow(derived.frame)) {
+    derived.row <- derived.frame[i,]
+    pairedID <- derived.row$paired.ID 
+    ab <- derived.row$antibiotic
+    ancestor.row <- filter(ancestor.frame, paired.ID == pairedID, antibiotic == ab)
+    compare.values <- c(compare.values, ifelse(derived.row$evolvability > ancestor.row$evolvability, 1, 
+                                               ifelse(derived.row$evolvability == ancestor.row$evolvability, 0, -1)))
+  }
+  
+  remove.cols.frame <- derived.frame %>%
+    select(-(paired.ID:evolvability))
+  
+  remove.cols.frame$dummy <- compare.values
+  
+  return(remove.cols.frame)
+}
+
+dummy.evo.df <- DummyVariables.Evo(evolvability.df)
+
+# Computes the *p*-value for each strain using the trinomial test
+pvalues.evo <- c()
+
+for (i in unique(antibiotics)) {
+  ab.subset <- dummy.evo.df %>% 
+   filter(antibiotic == i)
+  
+  for(j in unique(derived.strains)) {
+    strain.subset <- ab.subset %>% 
+      filter(strain == j)
+    
+    pvalues.evo <- c(pvalues.evo, TrinomialTest(strain.subset))
+  }
+}
+
+# This data frame corresponds to S2 Table
+pval.evo.df <- data.frame( 
+  strain = rep(derived.strains, 4),
+  antibiotic = rep(antibiotics, each = 4),
+  p = pvalues.evo
+  )
+
+# Combines *p*-values by the sum of logs (Fisher's) method
+combined.pval.evo.df <- map(antibiotics, function(x) {CalculateCombinedPValues(pval.evo.df, x)})
+names(combined.pval.evo.df) <- antibiotics
+
+print(combined.pval.evo.df)
+```
+<br>
+
+
+Under the *idiosyncratic* increases model, resistance gains are not correlated with the initial level of resistance. We therefore perform a non-parametric ANOVA (Kruskal-Wallis test).
+```{r Kruskal-Wallis test of strain evolvability (idiosyncratic increases)}
+PerformKWTest <- function(dat, ab) {
+  ab.filter <- dat %>% 
+    filter(antibiotic == ab)
+  
+  kruskal.wallis.test <- kruskal.test(x = ab.filter$evolvability, g = ab.filter$strain)
+  
+  return(kruskal.wallis.test)
+}
+
+kw.results <- map(antibiotics, function(x) {PerformKWTest(evolvability.df, x)})
+names(kw.results) <- antibiotics
+print(kw.results)
+```
+<br>
+
+
+## Maintenance of intrinsic tetracycline resistance and evolvability of strains isolated from the Ara+5 population
+
+We examined when the Ara+5 population lost the capacity to evolve tetracycline resistance by testing two strains (denoted "A" and "B") isolated from this population at generations 500, 1,000, 1,500, 2,000, 5,000, and 10,000. We first examine whether both i.) intrinsic and ii.) evolved tetracycline resistance levels differ between these backgrounds using Kruskal-Wallis tests. We then compare each derived strain to the ancestor using Dunnett's test.
+```{r Kruskal-Wallis and Dunnett tests of intrinsic and final resistance levels of Ara+5 strains}
+PerformKWTest.Ara5 <- function(dat, gen) {
+  genotype.filter <- dat %>% 
+    filter(genotype == gen)
+  
+  kruskal.wallis.test <- kruskal.test(x = genotype.filter$MIC, g = genotype.filter$strain)
+  
+  return(kruskal.wallis.test)
+}
+
+PerformDunnettTest <- function(dat, gen) {
+  genotype.filter <- dat %>% 
+    filter(genotype == gen)
+  
+  dunnett.test <- DunnettTest(x = genotype.filter$MIC, g = genotype.filter$strain, control = "0")
+}
+
+kw.results.ara5 <- map(genotypes, function(x) {PerformKWTest.Ara5(log2.ara5.df, x)})
+names(kw.results.ara5) <- paste("Ara+5", genotypes, sep = " ")
+print(kw.results.ara5)
+
+dunnett.results.ara5 <- map(genotypes, function(x) {PerformDunnettTest(log2.ara5.df, x)})
+names(dunnett.results.ara5) <- paste("Ara+5", genotypes, sep = " ")
+print(dunnett.results.ara5)
+```
+<br>
+
+
+Lastly, we examine whether the tetracycline resistance evolvability significantly differs between Ara+5 strains, and then compare each derived strain to the ancestor using Dunnett's test.  
+```{r Kruskal-Wallis and Dunnett tests of Ara+5 strains evolvability}
+# Calculates evolvability values for each Ara+5 strain
+CalculateEvolvability.Ara5 <- function(dat) { 
+  parental.frame <- dat %>% 
+    filter(genotype == "parent")
+  
+  daughter.frame <- dat %>% 
+    filter(genotype == "daughter")
+  
+  evolvability.values <- c()
+  
+  for(i in 1:nrow(daughter.frame)) {
+    row <- daughter.frame[i,]
+    rowID <- row$row.ID 
+    parent <- filter(parental.frame, row.ID == rowID)
+    evolvability.values <- c(evolvability.values, round(row$MIC - parent$MIC))
+  }
+  
+  remove.cols.frame <- daughter.frame %>% 
+    select(-(row.ID:MIC))
+  
+  remove.cols.frame$evolvability <- evolvability.values
+  
+  return(remove.cols.frame)
+}
+
+evolvability.ara5.df <- CalculateEvolvability.Ara5(log2.ara5.df)
+
+kw.results.evo.ara5 <- kruskal.test(x = evolvability.ara5.df$evolvability, g = evolvability.ara5.df$strain)
+print(kw.results.evo.ara5)
+
+dunnett.results.evo.ara5 <- DunnettTest(x = evolvability.ara5.df$evolvability, g = evolvability.ara5.df$strain, control = "0")
+print(dunnett.results.evo.ara5)
+```
+<br>
+
+
+## Fluctuation analyses
+
+We performed fluctuation analyses to compare the effective mutation rates to tetracycline resistance for the LTEE ancestor and clone A isolated from the Ara+5 population after 2,000 generations. 
+```{r Fluctuation test analysis}
+# Test for normality and equal variance assumptions of the cell count data
+TestAssumptions <- function(dat){
+  anc.frame <- dat %>% 
+    filter(strain == "REL606")
+  
+  evo.frame <- dat %>% 
+    filter(strain == "REL1162A")
+  
+  normality <- c()
+  for(i in unique(dat$strain)){
+    strain.frame <- dat %>% 
+      filter(strain == i)
+    
+    normality <- c(normality, (shapiro.test(strain.frame$cell.count)))
+  }
+  
+  variance <- var.test(anc.frame$cell.count, evo.frame$cell.count, alternative = "two.sided")
+  
+  t.assumptions <- list(normality, variance)
+  
+  return(t.assumptions)
+}
+
+test.assumptions <- TestAssumptions(cell.counts.df)
+names(test.assumptions) <- c("Shapiro-Wilk test", "F-test")
+print(test.assumptions)
+
+# Both strains have normally distributed cell counts with unequal variances. We therefore perform a Welch's t-test
+TTest <- function(dat){
+  anc.frame <- dat %>% 
+    filter(strain == "REL606")
+  
+  evo.frame <- dat %>% 
+    filter(strain == "REL1162A")
+  
+  ttest <- t.test(anc.frame$cell.count, evo.frame$cell.count, alternative = "two.sided", var.equal = FALSE)
+  
+  return(ttest)
+}
+
+t.test.cell.yield <- TTest(cell.counts.df)
+print(t.test.cell.yield)
+
+# Calculates the mean final number of cells in diluted samples
+CalculateMeanYields <- function(dat, strains) {
+  strain.frame <- dat %>% 
+    filter(strain == strains)
+  
+  mean.cell.yield <- mean(strain.frame$cell.count)
+  
+  return(mean.cell.yield)
+}
+
+cell.yields <- map(fluctuation.strains, function(x){CalculateMeanYields(cell.counts.df, x)})
+names(cell.yields) <- fluctuation.strains
+print(cell.yields)
+
+# Each replicate population was diluted 10,000-fold for quantification of cell yields
+dilution.factor <- 10000
+
+# True mean cell counts taking the dilution factor into consideration
+cell.yields <- Map("*", cell.yields, dilution.factor)
+
+# Estimates the expected number of mutational events per culture for both strains
+EstimateME <- function(dat, strains) {
+  strain.frame <- dat %>% 
+    filter(strain == strains)
+  
+  zero.count <- strain.frame %>% 
+    filter(n.colonies == 0) %>% 
+    nrow()
+  
+  n.replicates <- strain.frame %>% 
+    nrow()
+  
+  zeros <- zero.count
+  p0 <- zero.count / n.replicates # Proportion of replicate cultures without mutants
+  m <- -log(p0) # Expected number of mutational events
+  
+  fluc.test.parameters <- data.frame(zeros, n.replicates, p0, m)
+  
+  return(fluc.test.parameters)
+}
+
+ft.parameters <- map(fluctuation.strains, function(x){EstimateME(colony.counts.df, x)})
+names(ft.parameters) <- fluctuation.strains
+print(ft.parameters)
+
+# Estimates the mutation rate to tetracycline resistance for both strains and the 95% CIs of these point estimates
+EstimateMR <- function(fluc.param, c.yields, strains){
+  # Subsets the ft.parameters list by strain
+  strain.df <- fluc.param[[strains]]
+  
+  n.zeros <- strain.df$zeros
+  n.replicates <- strain.df$n.replicates
+  m.events <- strain.df$m
+
+  # Subsets the cell yield data for the given strain
+  yield <- c.yields[[strains]]
+  
+  mutation.rate <- m.events / yield
+  
+  # Estimation of 95% confidence intervals for the binomial proportion of zero mutant counts (p0)
+  p0.CIs <- binom.confint(x = strain.df$zeros,
+                       n = strain.df$n.replicates,
+                       conf.level = 0.95,
+                       methods = "ac")
+  
+  # Estimates the lower and upper bound 95% CIs of strain mutation rate to tetracycline resistance
+  mutation.rate.CI <- c()
+  
+  for(bound in bounds){
+    m.CI <- -log(p0.CIs[bound])
+    mutation.rate.CI <- c(mutation.rate.CI, (m.CI / yield))
+  }
+  
+  output <- data.frame(mutation.rate, mutation.rate.CI)
+  
+  return(output)
+}
+
+mutation.rates <- map(fluctuation.strains, function(x){EstimateMR(ft.parameters, cell.yields, x)})
+names(mutation.rates) <- fluctuation.strains
+
+print(mutation.rates)
+```
+
+
+***
+
+# Figures
+
+Figs 1 and S1 were made using Inkscape 0.92. All figures from the main text and Supplementary Information have been deposited on the open-access repository Figshare, and are thus freely available to use, modify, and share.
+
+Fig 2 - Intrinsic resistance usually declined over time in the absence of drug exposure.
+```{r Figure 2, fig.width = 12, fig.height = 5, fig.align = "center"}
+# Function to generate each figure panel
+GenerateFig2 <- function(dat, ab, panel.title, y.label, y.limit, y.breaks) {
+  filtered.frame <- dat %>% 
+    filter(antibiotic == ab, genotype == "parent")
+  
+  
+  panel.plot <- ggplot(filtered.frame, aes(x = strain, y = MIC)) +
+    geom_jitter(height = 0.15, width = 0, alpha = 0.6, size = 2.5, pch = 21, fill = "#0072B2", color = "#000000") +
+    stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
+               geom = "crossbar", width = 0.5, color = "#000000") +
+    ggtitle(panel.title) +
+    labs(y = y.label, x = "") +
+    scale_y_continuous(limit = y.limit, breaks = y.breaks) +
+    theme_set(theme_cowplot()) +
+    theme(axis.ticks.x = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(face = "plain", hjust = 0.5),
+          plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  
+  return(panel.plot)
+}
+
+# Panels
+fig.2a <- GenerateFig2(expanded.df, "amp", "Ampicillin", expression("Log"[2]~"MIC (\u03BCg/mL)"), c(-3, 2), c(-3, -2, -1, 0, 1, 2))
+fig.2b <- GenerateFig2(expanded.df, "cro", "Ceftriaxone", "", c(-11, -6), c(-11, -10, -9, -8, -7, -6))
+fig.2c <- GenerateFig2(expanded.df, "cip", "Ciprofloxacin", "", c(-11, -6), c(-11, -10, -9, -8, -7, -6))
+fig.2d <- GenerateFig2(expanded.df, "tet", "Tetracycline", "", c(-2, 3), c(-2, -1, 0, 1, 2, 3))
+
+fig.2 <- plot_grid(fig.2a, fig.2b, fig.2c, fig.2d, labels = c("A", "B", "C", "D"), label_fontface = "bold", nrow = 1)
+print(fig.2)
+
+# ggsave("fig2.png", fig.2, path = "Figures", device = "png", width = 12, height = 5)
+```
+<br>
+
+
+Fig. 3 - Genetic background affects the evolvability of LTEE lines exposed to antibiotics.
+```{r Figure 3, fig.width = 12, fig.height = 5, fig.align = "center"}
+# Computes the median MIC for each strain and antibiotic combination
+med.MIC <- c()
+
+for (i in unique(antibiotics)) {
+  ab.filter <- expanded.df %>% 
+    filter(antibiotic == i)
+  
+  for(j in unique(anc.derived.strains)) {
+    strain.filter <- ab.filter %>% 
+      filter(strain == j)
+    
+    for(k in unique(genotypes)) {
+      genotype.filter <- strain.filter %>% 
+        filter(genotype == k)
+      
+      med.MIC <- c(med.MIC, median(genotype.filter$MIC))
+    }
+  }
+}
+
+med.MIC.df <- data.frame(
+  strain = rep(anc.derived.strains, each = 2) %>% rep(4),
+  antibiotic = rep(antibiotics, each = 10),
+  genotype = rep(genotypes, 20),
+  median = med.MIC
+)
+
+GenerateFig3 <- function(dat, ab, panel.title, y.label, y.limit, y.breaks) {
+  # Prep data
+  ab.frame <- dat %>% 
+    filter(antibiotic == ab)
+  
+  parental.frame <- ab.frame %>% 
+    filter(genotype == "parent") %>% 
+    spread(genotype, median) %>% 
+    rename("parent.med" = "parent")
+  
+  daughter.frame <- ab.frame %>% 
+    filter(genotype == "daughter") %>% 
+    spread(genotype, median) %>% 
+    rename("daughter.med" = "daughter")
+  
+  master.frame <- left_join(parental.frame, daughter.frame, by = c("strain", "antibiotic"))
+  
+  left.label <- master.frame$strain
+  right.label <- master.frame$strain
+
+  # Plot
+  panel.plot <- ggplot(master.frame) +
+    geom_segment(aes(x = 1, xend = 2, y = parent.med, yend = daughter.med, col = class),
+                 color = "black", show.legend = F) +
+    geom_point(aes(x = 1, y = parent.med), size = 2.5, pch = 21, fill = "#0072B2", color = "#ffffff", stroke = 1.5) +
+    geom_point(aes(x = 2, y = daughter.med), size = 2.5, pch = 21, fill = "#0072B2", color = "#ffffff", stroke = 1.5) +
+    geom_text_repel(label = left.label, x = rep(1, nrow(master.frame)), y = master.frame$parent.med, direction = "y", nudge_x = -0.3, segment.size = 0.2) + 
+    geom_text_repel(label = right.label, x = rep(2, nrow(master.frame)), y = master.frame$daughter.med, direction = "y", nudge_x = 0.3, segment.size = 0.2) +
+    ggtitle(panel.title) +
+    labs(y = y.label, x = "") +
+    scale_x_discrete(limits = c("Susceptible \nparental cells", "Resistant \ndaughter cells")) +
+    scale_y_continuous(limit = y.limit, breaks = y.breaks) +
+    theme_set(theme_cowplot()) +
+    theme(axis.ticks.x = element_blank(),
+          plot.title = element_text(face = "plain", hjust = 0.5),
+          plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  
+  return(panel.plot)
+}
+
+# Panels
+fig.3a <- GenerateFig3(med.MIC.df, "amp", "Ampicillin", expression("Log"[2]~"MIC (\u03BCg/mL)"), c(-4, 4), c(-4, -3, -2, -1, 0, 1, 2, 3, 4))
+fig.3b <- GenerateFig3(med.MIC.df, "cro", "Ceftriaxone", "", c(-10, -2), c(-10, -9, -8, -7, -6, -5, -4, -3, -2))
+fig.3c <- GenerateFig3(med.MIC.df, "cip", "Ciprofloxacin", "", c(-12, -4), c(-12, -11, -10, -9, -8, -7, -6, -5, -4))
+fig.3d <- GenerateFig3(med.MIC.df, "tet", "Tetracycline", "", c(-3, 5), c(-3, -2, -1, 0, 1, 2, 3, 4, 5))
+
+fig.3 <- plot_grid(fig.3a, fig.3b, fig.3c, fig.3d, labels = c("A", "B", "C", "D"), label_fontface = "bold", nrow = 1)
+print(fig.3)
+
+# ggsave("fig3.png", fig.3, path = "Figures", device = "png", width = 15, height = 5)
+```
+<br>
+
+
+Fig. 4 - Capacity to evolve resistance to tetracycline in a single step was diminished early in one LTEE lineage. 
+```{r Figure 4, fig.width = 12, fig.height = 5, fig.align = "center"}
+# Function to generate figure 4, panels "A" and "B"
+GenerateFig4.ab <- function(dat, gen, y.label, x.label) {
+  genotype.frame <- dat %>% 
+    filter(genotype == gen)
+  
+  panel.ab.plot <- ggplot(genotype.frame, aes(x = strain, y = MIC)) +
+    geom_jitter(height = 0.15, width = 0, alpha = 0.6, size = 2.5, pch = 21, fill = "#0072B2", color = "#000000") +
+    stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
+                 geom = "crossbar", width = 0.5, color = "#000000") +
+    labs(y = y.label, x = x.label) +
+    scale_x_discrete(limits = ara5.strains) +
+    scale_y_continuous(limit = c(-0.5, 3.5), breaks = c(0, 1, 2, 3)) +
+    theme(axis.ticks.x = element_blank(),
+          axis.text.x = element_text(angle = 90, hjust = 1),
+          plot.margin = unit(c(0.75, 0, 0, 0), "cm"))
+    
+  return(panel.ab.plot)
+}
+
+# Panels
+fig.4a <- GenerateFig4.ab(log2.ara5.df, "parent", expression("Log"[2]~"MIC (\u03BCg/mL)"), "")
+fig.4b <- GenerateFig4.ab(log2.ara5.df, "daughter", "", "Strain")
+
+# Code to generate figure 4, panel "C"
+fig.4c <- ggplot(evolvability.ara5.df, aes(x = strain, y = evolvability)) +
+  geom_jitter(height = 0.15, width = 0, alpha = 0.6, size = 2.5, pch = 21, fill = "#0072B2", color = "#000000") +
+  stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
+               geom = "crossbar", width = 0.5, color = "#000000") +
+  labs(y = expression("Log"[2]*" MIC"[evolved]*" \u2013 Log"[2]*" MIC"[intrinsic]), x = "") +
+  scale_x_discrete(limits = ara5.strains) +
+  scale_y_continuous(limit = c(-0.5, 3.5), breaks = c(0, 1, 2, 3)) +
+  theme_set(theme_cowplot()) +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1),
+        plot.margin = unit(c(0.75, 0, 0, 1), "cm"))
+
+
+fig.4 <- plot_grid(fig.4a, fig.4b, fig.4c, labels = c("A", "B", "C"), label_fontface = "bold", nrow = 1)
+print(fig.4)
+
+# ggsave("fig4.png", fig.4, path = "Figures", device = "png", width = 12, height = 5)
+```
+<br>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
